@@ -217,7 +217,7 @@ class GPTModel(MegatronModule):
                 retriever_position_ids=None,
                 retriever_attn_mask=None,
                 labels=None, tokentype_ids=None, inference_params=None,
-                curriculum_seqlen=None):
+                curriculum_seqlen=None, compare_update=False):
         args = get_args()
         if curriculum_seqlen is not None:
             args.curriculum_seqlen = curriculum_seqlen
@@ -243,7 +243,8 @@ class GPTModel(MegatronModule):
             retriever_input_ids=retriever_input_ids,
             retriever_position_ids=retriever_position_ids,
             retriever_attn_mask=retriever_attn_mask,
-            inference_params=inference_params)
+            inference_params=inference_params,
+            compare_update=compare_update)
 
         if self.post_process:
             lm_output = post_language_model_processing(

@@ -171,7 +171,8 @@ def forward_step(forward_step_func,
                  forward_data_store,
                  config,
                  collect_non_loss_data=False,
-                 checkpoint_activations_microbatch=None):
+                 checkpoint_activations_microbatch=None,
+                 compare_update=False):
     """Forward step for passed-in model.
 
     If first stage, input tensor is obtained from data_iterator, otherwise
@@ -196,7 +197,8 @@ def forward_step(forward_step_func,
         context_manager = contextlib.nullcontext()
     with context_manager:
         if checkpoint_activations_microbatch is None:
-            output_tensor, loss_func = forward_step_func(data_iterator, model)
+            output_tensor, loss_func = forward_step_func(
+                data_iterator, model, compare_update=compare_update)
         else:
             output_tensor, loss_func = forward_step_func(data_iterator, model, checkpoint_activations_microbatch)
 
@@ -309,6 +311,7 @@ def forward_backward_no_pipelining(*,
                                    decoder_seq_length: int = None, # unused
                                    forward_only: bool = False,
                                    collect_non_loss_data: bool = False,
+                                   compare_update: bool = False,
                                    ):
     """Run forward and backward passes with no pipeline parallelism
     (no inter-stage communication).
@@ -347,19 +350,27 @@ def forward_backward_no_pipelining(*,
     with no_sync_func():
         for i in range(num_microbatches - 1):
             output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
-                                         input_tensor, forward_data_store, config, collect_non_loss_data)
+                                         input_tensor, forward_data_store, config, collect_non_loss_data,
+                                         compare_update)
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, model)
+                for layer in model.children():
+                    if hasattr(layer, 'save_kv_gardient'):
+                        layer.save_kv_gardient()
     if args.deepspeed:
         model.set_gradient_accumulation_boundary(True)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
     output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
-                                 input_tensor, forward_data_store, config, collect_non_loss_data)
+                                 input_tensor, forward_data_store, config, collect_non_loss_data,
+                                 compare_update)
 
     if not forward_only:
         backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, model)
+        for layer in model.children():
+            if hasattr(layer, 'save_kv_gardient'):
+                layer.save_kv_gardient()
 
     return forward_data_store
 
