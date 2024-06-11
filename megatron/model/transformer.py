@@ -688,7 +688,7 @@ class ParallelAttention(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_params=None,
-                rotary_pos_emb=None):
+                rotary_pos_emb=None, compare_update=False):
         # hidden_states: [sq, b, h]
 
         # =================================================
@@ -759,10 +759,62 @@ class ParallelAttention(MegatronModule):
             query_layer = query_layer.view(*new_tensor_shape)
 
 
-        self._curr_key_layer = key_layer
-        self._curr_value_layer = value_layer
-        self._minibatch_key_layers.append(key_layer.to(device='cpu'))
-        self._minibatch_value_layers.append(value_layer.to(device='cpu'))
+        if compare_update:
+            prev_minibatch_key_layer = self._minibatch_key_layers.pop(0)
+            prev_minibatch_key_layer_gradient = \
+                self._minibatch_key_layers_gradient.pop(0)
+
+            # calculation on cpu
+            _key_layer = key_layer.to(prev_minibatch_key_layer)
+            k_diff = (_key_layer - prev_minibatch_key_layer)
+            # overall diff
+            k_diff_mean = k_diff.mean()
+            self.batch_k_diff.append(k_diff_mean)
+            self.batch_abs_k_diff.append(k_diff.abs().mean())
+
+            k_grad_mean = prev_minibatch_key_layer_gradient.mean()
+            self.batch_k_grad.append(k_grad_mean)
+            self.batch_abs_k_grad.append(
+                prev_minibatch_key_layer_gradient.abs().mean())
+
+
+            dev_k_diff = (k_diff - k_diff_mean)
+            dev_k_grad = (prev_minibatch_key_layer_gradient - k_grad_mean)
+
+            self.batch_k_grad_corr.append((dev_k_diff * dev_k_grad).sum() / (
+                torch.sqrt((dev_k_diff ** 2).sum())
+                * torch.sqrt((dev_k_grad ** 2).sum())))
+
+
+            # value update data
+            prev_minibatch_value_layer = self._minibatch_value_layers.pop(0)
+            prev_minibatch_value_layer_gradient = \
+                self._minibatch_value_layers_gradient.pop(0)
+
+            _value_layer = value_layer.to(prev_minibatch_value_layer)
+            v_diff = (_value_layer - prev_minibatch_value_layer)
+            # overall diff
+            v_diff_mean = k_diff.mean()
+            self.batch_v_diff.append(v_diff_mean)
+            self.batch_abs_v_diff.append(v_diff.abs().mean())
+
+            v_grad_mean = prev_minibatch_value_layer_gradient.mean()
+            self.batch_v_grad.append(v_grad_mean)
+            self.batch_abs_v_grad.append(
+                prev_minibatch_value_layer_gradient.abs().mean())
+
+
+            dev_v_diff = (v_diff - v_diff_mean)
+            dev_v_grad = (prev_minibatch_value_layer_gradient - v_grad_mean)
+
+            self.batch_v_grad_corr.append((dev_v_diff * dev_v_grad).sum() / (
+                torch.sqrt((dev_v_diff ** 2).sum())
+                * torch.sqrt((dev_v_grad ** 2).sum())))
+        else:
+            self._curr_key_layer = key_layer
+            self._curr_value_layer = value_layer
+            self._minibatch_key_layers.append(key_layer.to(device='cpu'))
+            self._minibatch_value_layers.append(value_layer.to(device='cpu'))
 
         # ==================================
         # Adjust key and value for inference
@@ -879,236 +931,6 @@ class ParallelAttention(MegatronModule):
             self._minibatch_value_layers_gradient.append(
                 self._curr_value_layer.grad.to('cpu'))
 
-
-    def compare_update(self,  hidden_states, attention_mask,
-                       encoder_output=None, inference_params=None,
-                       rotary_pos_emb=None):
-        # hidden_states: [sq, b, h]
-
-        # =================================================
-        # Pre-allocate memory for key-values for inference.
-        # =================================================
-        is_first_step = False
-        if inference_params:
-            if self.layer_number not in inference_params.key_value_memory_dict:
-                inf_max_seq_len = inference_params.max_sequence_len
-                inf_max_batch_size = inference_params.max_batch_size
-                inference_key_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size)
-                inference_value_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size)
-                inference_params.key_value_memory_dict[self.layer_number] = (
-                    inference_key_memory, inference_value_memory)
-                is_first_step = True
-            else:
-                inference_key_memory, inference_value_memory = \
-                    inference_params.key_value_memory_dict[self.layer_number]
-
-        # =====================
-        # Query, Key, and Value
-        # =====================
-
-        if self.attention_type == AttnType.self_attn:
-            # Attention heads [sq, b, h] --> [sq, b, ((nq + 2 * nkv) * hn)]
-            mixed_x_layer, _ = self.query_key_value(hidden_states)
-
-            # [sq, b, ((nq + 2 * nkv) * hn)] --> [sq, b, nkv, (nq // nkv + 2), hn]
-            new_tensor_shape = mixed_x_layer.size()[:-1] + \
-                (-1, (self.num_key_value_groups + 2),
-                 self.hidden_size_per_attention_head)
-            mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
-
-            # [sq, b, nkv, (nq // nkv + 2), hn] --> 3 [sq, b, np, hn]
-            (query_layer,
-             key_layer,
-             value_layer) = self.split_tensor(mixed_x_layer)
-
-            # Repeat kv
-            if self.use_gqa:
-                key_layer = self.repeat_kv(key_layer, self.num_key_value_groups)
-                value_layer = self.repeat_kv(value_layer,
-                                             self.num_key_value_groups)
-        else:
-            assert not self.use_gqa, 'GQA + cross-attn not tested yet'
-
-            # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-            mixed_kv_layer, _ = self.key_value(encoder_output)
-
-            # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
-            new_tensor_shape = mixed_kv_layer.size()[:-1] + \
-                (self.num_attention_heads_per_partition,
-                 2 * self.hidden_size_per_attention_head)
-            mixed_kv_layer = mixed_kv_layer.view(*new_tensor_shape)
-
-            # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
-            (key_layer,
-             value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_kv_layer, 2)
-
-            # Attention head [sq, b, h] --> [sq, b, hp]
-            query_layer, _ = self.query(hidden_states)
-            # [sq, b, hp] --> [sq, b, np, hn]
-            new_tensor_shape = query_layer.size()[:-1] + \
-                (self.num_attention_heads_per_partition,
-                 self.hidden_size_per_attention_head)
-            query_layer = query_layer.view(*new_tensor_shape)
-
-        
-        prev_minibatch_key_layer = self._minibatch_key_layers.pop(0)
-        prev_minibatch_key_layer_gradient = \
-            self._minibatch_key_layers_gradient.pop(0)
-
-        _key_layer = key_layer.to(prev_minibatch_key_layer)
-        k_diff = (_key_layer - prev_minibatch_key_layer)
-        # overall diff
-        k_diff_mean = k_diff.mean()
-        self.batch_k_diff.append(k_diff_mean)
-        self.batch_abs_k_diff.append(k_diff.abs().mean())
-
-        k_grad_mean = prev_minibatch_key_layer_gradient.mean()
-        self.batch_k_grad.append(k_grad_mean)
-        self.batch_abs_k_grad.append(
-            prev_minibatch_key_layer_gradient.abs().mean())
-
-
-        dev_k_diff = (k_diff - k_diff_mean)
-        dev_k_grad = (prev_minibatch_key_layer_gradient - k_grad_mean)
-
-        self.batch_k_grad_corr.append((dev_k_diff * dev_k_grad).sum() / (
-            torch.sqrt((dev_k_diff ** 2).sum())
-            * torch.sqrt((dev_k_grad ** 2).sum())))
-
-
-        # value update data
-        prev_minibatch_value_layer = self._minibatch_value_layers.pop(0)
-        prev_minibatch_value_layer_gradient = \
-            self._minibatch_value_layers_gradient.pop(0)
-
-        _value_layer = value_layer.to(prev_minibatch_value_layer)
-        v_diff = (_value_layer - prev_minibatch_value_layer)
-        # overall diff
-        v_diff_mean = k_diff.mean()
-        self.batch_v_diff.append(v_diff_mean)
-        self.batch_abs_v_diff.append(v_diff.abs().mean())
-
-        v_grad_mean = prev_minibatch_value_layer_gradient.mean()
-        self.batch_v_grad.append(v_grad_mean)
-        self.batch_abs_v_grad.append(
-            prev_minibatch_value_layer_gradient.abs().mean())
-
-
-        dev_v_diff = (v_diff - v_diff_mean)
-        dev_v_grad = (prev_minibatch_value_layer_gradient - v_grad_mean)
-
-        self.batch_v_grad_corr.append((dev_v_diff * dev_v_grad).sum() / (
-            torch.sqrt((dev_v_diff ** 2).sum())
-            * torch.sqrt((dev_v_grad ** 2).sum())))
-
-
-        # ==================================
-        # Adjust key and value for inference
-        # ==================================
-
-        # duplicate the pos_emb for self attention
-        if rotary_pos_emb is not None:
-            if isinstance(rotary_pos_emb, tuple):
-                rotary_pos_emb = rotary_pos_emb
-            else:
-                rotary_pos_emb = ((rotary_pos_emb,) * 2)
-
-        if inference_params:
-            batch_start = inference_params.batch_size_offset
-            batch_end = batch_start + key_layer.size(1)
-            assert batch_end <= inference_key_memory.size(1)
-            sequence_start = inference_params.sequence_len_offset
-            sequence_end = sequence_start + key_layer.size(0)
-            assert sequence_end <= inference_key_memory.size(0)
-            # Copy key and values.
-            inference_key_memory[sequence_start:sequence_end,
-                                 batch_start:batch_end, ...] = key_layer
-            inference_value_memory[sequence_start:sequence_end,
-                                   batch_start:batch_end, ...] = value_layer
-            key_layer = inference_key_memory[
-                :sequence_end, batch_start:batch_end, ...]
-            value_layer = inference_value_memory[
-                :sequence_end, batch_start:batch_end, ...]
-
-
-            # adjust the key rotary positional embedding
-            if rotary_pos_emb is not None:
-                q_pos_emb, k_pos_emb = rotary_pos_emb
-                # need to cross check this condition during inference
-                # if not set_inference_key_value_memory:
-                if not is_first_step:
-                    # In inference, we compute one token at a time.
-                    # Select the correct positional embedding
-                    # (only the last token in the sequence)
-                    q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
-                else:
-                    # In the first forward pass of inference,
-                    # we use the entire provided prefix.
-                    # q_pos_emb here has the rope embeddings of the entire
-                    # prefix + to-be-generated output so
-                    # we slice to just the prefix.
-                    q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
-                k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
-                rotary_pos_emb = (q_pos_emb, k_pos_emb)
-
-
-        # ==================================
-        # core attention computation
-        # ==================================
-
-        # apply relative positional encoding (rotary embedding)
-        if rotary_pos_emb is not None:
-            q_pos_emb, k_pos_emb = rotary_pos_emb
-            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb)
-            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb)
-            # TODO, can apply positional embedding to value_layer so it has
-            # absolute positional embedding.
-            # otherwise, only relative positional embedding takes effect
-            # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
-
-        if self.enable_ds_sequence_parallel:
-            if self.use_flash_attn:
-                if not self.use_flash_attn_triton:
-                    query_layer, key_layer, value_layer = [rearrange(x, 's b ... -> b s ...').contiguous()
-                            for x in (query_layer, key_layer, value_layer)]
-
-                context_layer = self.dist_attn(query_layer, key_layer, value_layer)
-
-                if not self.use_flash_attn_triton:
-                    context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
-            else:
-                context_layer = self.dist_attn(query_layer, key_layer, value_layer, attention_mask)
-        else:
-            if self.use_flash_attn:
-                if not self.use_flash_attn_triton:
-                    query_layer, key_layer, value_layer = [rearrange(x, 's b ... -> b s ...').contiguous()
-                            for x in (query_layer, key_layer, value_layer)]
-
-                if self.sequence_parallel:
-                    context_layer = self.core_attention_flash(query_layer, key_layer, value_layer)
-                else:
-                    with tensor_parallel.get_cuda_rng_tracker().fork():
-                        context_layer = self.core_attention_flash(query_layer, key_layer, value_layer)
-
-                if not self.use_flash_attn_triton:
-                    context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
-            else:
-                if self.checkpoint_core_attention:
-                    context_layer = self._checkpointed_attention_forward(
-                        query_layer, key_layer, value_layer, attention_mask)
-                else:
-                    context_layer = self.core_attention(
-                        query_layer, key_layer, value_layer, attention_mask)
-
-        # =================
-        # Output. [sq, b, h]
-        # =================
-
-        output, bias = self.dense(context_layer)
-
-        return output, bias
 
 def bias_dropout_add(x, bias, residual, prob, training):
     # type: (Tensor, Optional[Tensor], Tensor, float, bool) -> Tensor
@@ -1503,20 +1325,13 @@ class ParallelTransformerLayer(MegatronModule):
         layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
-        if compare_update:
-            attention_output, attention_bias = \
-                self.self_attention.compare_update(
-                    layernorm_output,
-                    attention_mask,
-                    inference_params=inference_params,
-                    rotary_pos_emb=rotary_pos_emb)
-        else:
-            attention_output, attention_bias = \
-                self.self_attention(
-                    layernorm_output,
-                    attention_mask,
-                    inference_params=inference_params,
-                    rotary_pos_emb=rotary_pos_emb)
+        attention_output, attention_bias = \
+            self.self_attention(
+                layernorm_output,
+                attention_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                compare_update=compare_update)
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
