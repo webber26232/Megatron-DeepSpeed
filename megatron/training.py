@@ -697,6 +697,10 @@ def train_step(forward_step_func, data_iterator,
     if args.timing_log_level < 2:
         config.timers = None
 
+    # make a copy of data_iterator before forward
+    from copy import deepcopy
+    data_iterator_copy = deepcopy(data_iterator)
+
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
@@ -739,6 +743,17 @@ def train_step(forward_step_func, data_iterator,
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     timers('optimizer').stop()
+
+    # Compare updated kv
+    updated_losses_reduced = forward_backward_func(
+        forward_step_func=forward_step_func,
+        data_iterator=data_iterator_copy,
+        model=model,
+        num_microbatches=get_num_microbatches(),
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        decoder_seq_length=args.decoder_seq_length,
+        forward_only=True, compare_update=True)
 
     # Gather params.
     if not args.deepspeed and update_successful:

@@ -254,7 +254,7 @@ def calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, at
         mos_loss = mos_loss.div(args.seq_length) * beta
     return mos_loss
 
-def forward_step(data_iterator, model):
+def forward_step(data_iterator, model, compare_update=False):
     """Forward step."""
     args = get_args()
     timers = get_timers()
@@ -273,14 +273,16 @@ def forward_step(data_iterator, model):
 
     if args.mos or args.kd:
         # The forward func can return either the loss or the logits, depending on whether passing in the labels or not.
-        stu_output, other_losses = model(tokens, position_ids, attention_mask)
+        stu_output, other_losses = model(tokens, position_ids, attention_mask,
+                                         compare_update=compare_update)
         if args.curriculum_learning_legacy and args.curriculum_seqlen < args.seq_length:
             assert args.curriculum_seqlen is not None
             labels = labels[:, :args.curriculum_seqlen].contiguous()
         output_tensor = tensor_parallel.vocab_parallel_cross_entropy(stu_output.contiguous().float(), labels)
     else:
         output_tensor, other_losses = model(tokens, position_ids, attention_mask,
-                                            labels=labels)
+                                            labels=labels,
+                                            compare_update=compare_update)
     if args.curriculum_learning_legacy and args.curriculum_seqlen < args.seq_length:
         loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
 

@@ -616,6 +616,26 @@ class ParallelAttention(MegatronModule):
             input_is_parallel=True,
             skip_bias_add=True)
 
+        self._curr_key_layer = None
+        self._curr_value_layer = None
+        self._minibatch_key_layers = []
+        self._minibatch_value_layers = []
+        self._minibatch_key_layers_gradient = []
+        self._minibatch_value_layers_gradient = []
+
+        # kv update records
+        self.batch_k_diff = []
+        self.batch_abs_k_diff = []
+        self.batch_k_grad = []
+        self.batch_abs_k_grad = []
+        self.batch_k_grad_corr = []
+
+        self.batch_v_diff = []
+        self.batch_abs_v_diff = []
+        self.batch_v_grad = []
+        self.batch_abs_v_grad = []
+        self.batch_v_grad_corr = []
+
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
                                         value_layer, attention_mask,
@@ -668,7 +688,7 @@ class ParallelAttention(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_params=None,
-                rotary_pos_emb=None):
+                rotary_pos_emb=None, compare_update=False):
         # hidden_states: [sq, b, h]
 
         # =================================================
@@ -737,6 +757,64 @@ class ParallelAttention(MegatronModule):
                 (self.num_attention_heads_per_partition,
                  self.hidden_size_per_attention_head)
             query_layer = query_layer.view(*new_tensor_shape)
+
+
+        if compare_update:
+            prev_minibatch_key_layer = self._minibatch_key_layers.pop(0)
+            prev_minibatch_key_layer_gradient = \
+                self._minibatch_key_layers_gradient.pop(0)
+
+            # calculation on cpu
+            _key_layer = key_layer.to(prev_minibatch_key_layer)
+            k_diff = (_key_layer - prev_minibatch_key_layer)
+            # overall diff
+            k_diff_mean = k_diff.mean()
+            self.batch_k_diff.append(k_diff_mean)
+            self.batch_abs_k_diff.append(k_diff.abs().mean())
+
+            k_grad_mean = prev_minibatch_key_layer_gradient.mean()
+            self.batch_k_grad.append(k_grad_mean)
+            self.batch_abs_k_grad.append(
+                prev_minibatch_key_layer_gradient.abs().mean())
+
+
+            dev_k_diff = (k_diff - k_diff_mean)
+            dev_k_grad = (prev_minibatch_key_layer_gradient - k_grad_mean)
+
+            self.batch_k_grad_corr.append((dev_k_diff * dev_k_grad).sum() / (
+                torch.sqrt((dev_k_diff ** 2).sum())
+                * torch.sqrt((dev_k_grad ** 2).sum())))
+
+
+            # value update data
+            prev_minibatch_value_layer = self._minibatch_value_layers.pop(0)
+            prev_minibatch_value_layer_gradient = \
+                self._minibatch_value_layers_gradient.pop(0)
+
+            _value_layer = value_layer.to(prev_minibatch_value_layer)
+            v_diff = (_value_layer - prev_minibatch_value_layer)
+            # overall diff
+            v_diff_mean = k_diff.mean()
+            self.batch_v_diff.append(v_diff_mean)
+            self.batch_abs_v_diff.append(v_diff.abs().mean())
+
+            v_grad_mean = prev_minibatch_value_layer_gradient.mean()
+            self.batch_v_grad.append(v_grad_mean)
+            self.batch_abs_v_grad.append(
+                prev_minibatch_value_layer_gradient.abs().mean())
+
+
+            dev_v_diff = (v_diff - v_diff_mean)
+            dev_v_grad = (prev_minibatch_value_layer_gradient - v_grad_mean)
+
+            self.batch_v_grad_corr.append((dev_v_diff * dev_v_grad).sum() / (
+                torch.sqrt((dev_v_diff ** 2).sum())
+                * torch.sqrt((dev_v_grad ** 2).sum())))
+        else:
+            self._curr_key_layer = key_layer
+            self._curr_value_layer = value_layer
+            self._minibatch_key_layers.append(key_layer.to(device='cpu'))
+            self._minibatch_value_layers.append(value_layer.to(device='cpu'))
 
         # ==================================
         # Adjust key and value for inference
@@ -843,6 +921,15 @@ class ParallelAttention(MegatronModule):
         output, bias = self.dense(context_layer)
 
         return output, bias
+
+
+    def save_kv_gardient(self):
+        if self._curr_key_layer is not None:
+            self._minibatch_key_layers_gradient.append(
+                self._curr_key_layer.grad.to('cpu'))
+        if self._curr_value_layer is not None:
+            self._minibatch_value_layers_gradient.append(
+                self._curr_value_layer.grad.to('cpu'))
 
 
 def bias_dropout_add(x, bias, residual, prob, training):
@@ -1230,7 +1317,8 @@ class ParallelTransformerLayer(MegatronModule):
                 retriever_attn_mask=None,
                 inference_params=None,
                 rotary_pos_emb=None,
-                aggregated_moe_loss=None):
+                aggregated_moe_loss=None,
+                compare_update=False):
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
@@ -1242,7 +1330,8 @@ class ParallelTransformerLayer(MegatronModule):
                 layernorm_output,
                 attention_mask,
                 inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb)
+                rotary_pos_emb=rotary_pos_emb,
+                compare_update=compare_update)
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -1889,7 +1978,8 @@ class ParallelTransformer(MegatronModule):
                 retriever_output=None,
                 retriever_attn_mask=None,
                 inference_params=None,
-                rotary_pos_emb=None):
+                rotary_pos_emb=None,
+                compare_update=False):
         # hidden_states: [s, b, h]
 
         # Checks.
@@ -1964,6 +2054,9 @@ class ParallelTransformer(MegatronModule):
                 # Forward pass.
                 moe_losses = []
                 if self.checkpoint_activations:
+                    if compare_update:
+                        raise ValueError('compare update not implemented in '
+                                         'checkpoint_activations.')
                     hidden_states, moe_losses = self._checkpointed_forward(hidden_states,
                                                                attention_mask,
                                                                encoder_output,
@@ -1971,6 +2064,9 @@ class ParallelTransformer(MegatronModule):
                                                                rotary_pos_emb,
                                                                is_first_microbatch)
                 elif self.recompute_granularity == 'full':
+                    if compare_update:
+                        raise ValueError('compare update not implemented in '
+                                         'recompute_granularity.')
                     hidden_states, moe_losses = self._checkpointed_forward(hidden_states,
                                                                attention_mask,
                                                                encoder_output,
@@ -1982,6 +2078,7 @@ class ParallelTransformer(MegatronModule):
                         'encoder_output': encoder_output,
                         'enc_dec_attn_mask': enc_dec_attn_mask,
                         'inference_params': inference_params,
+                        'compare_update': compare_update
                     }
 
                     if self.transformer_impl == 'transformer_engine':
